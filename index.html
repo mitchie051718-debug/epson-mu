@@ -1,6 +1,404 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
+<!doctype html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Epson Main Units Sales Portal</title>
@@ -290,34 +688,64 @@ footer.site{background:var(--blue-deep);color:#cdd7ee;margin-top:10px}
 .cnsnone{padding:40px;text-align:center;color:var(--muted);grid-column:1/-1}
 .mtab .c.cns{background:#6a1b9a}
 .mtab.on .c.cns{background:#6a1b9a}
+
+/* ADMIN EDITOR */
+/* ===== inline admin editor ===== */
+.adminbtn{font:inherit;font-size:13px;font-weight:600;cursor:pointer;background:rgba(255,255,255,.14);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:5px 11px;margin-left:6px;line-height:1}
+.adminbtn:hover{background:rgba(255,255,255,.25)}
+.ion-modal{position:fixed;inset:0;background:rgba(15,25,45,.55);display:none;align-items:center;justify-content:center;z-index:9000}
+.ion-modal.open{display:flex}
+.ion-modal-box{background:#fff;border-radius:16px;padding:26px 26px 20px;width:min(92vw,360px);box-shadow:0 24px 60px rgba(0,0,0,.3);font-family:inherit}
+.ion-modal-box h3{margin:0 0 6px;font-size:19px;color:#0f1b2d}
+.ion-modal-box p{margin:0 0 14px;font-size:13.5px;color:#5b6470;line-height:1.5}
+.ion-modal-box input{width:100%;box-sizing:border-box;padding:11px 13px;border:1.5px solid var(--line,#d7dce2);border-radius:10px;font-size:15px;outline:none}
+.ion-modal-box input:focus{border-color:var(--blue,#003399)}
+.ion-err{color:#c62828;font-size:13px;min-height:18px;margin-top:7px}
+.ion-modal-actions{display:flex;gap:9px;justify-content:flex-end;margin-top:6px}
+.ion-btn{font:inherit;font-size:13.5px;font-weight:600;cursor:pointer;border-radius:9px;padding:9px 16px;border:1px solid var(--blue,#003399);background:var(--blue,#003399);color:#fff;line-height:1}
+.ion-btn:hover{filter:brightness(1.1)}
+.ion-btn.ghost{background:#fff;color:var(--blue,#003399)}
+.ion-btn.ghost:hover{background:#eef2fb;filter:none}
+.ion-adminbar{position:fixed;left:0;right:0;bottom:0;z-index:8000;display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:10px 18px;background:#0f1b2d;color:#eef2f8;box-shadow:0 -6px 24px rgba(0,0,0,.25);font-family:inherit}
+.ion-abtxt{font-size:12.5px;line-height:1.45;flex:1;min-width:220px;color:#c9d3e0}
+.ion-abtxt b{color:#fff}.ion-abtxt u{text-decoration-color:#5b9bff}
+.ion-abbtns{display:flex;align-items:center;gap:9px;margin-left:auto}
+.ion-dirty{font-size:12px;font-weight:600;color:#9fb3cc;margin-right:4px;white-space:nowrap}
+/* editable affordances only in admin mode */
+body.admin-on [data-f]{cursor:text;border-radius:5px;transition:background .12s,box-shadow .12s;outline:1px dashed transparent;outline-offset:2px}
+body.admin-on [data-f]:hover{background:#fff6d6;outline-color:#e0b400}
+body.admin-on [data-f].ion-editing{background:#fffbe9;outline:1.5px solid var(--blue,#003399);box-shadow:0 0 0 3px rgba(0,51,153,.12)}
+body.admin-on .prices [data-f]{display:inline-block}
+/* image edit overlay */
+.editimg{display:none}
+body.admin-on [data-editimg]{position:relative}
+body.admin-on .editimg{display:inline-flex;align-items:center;gap:4px;position:absolute;top:5px;right:5px;z-index:5;font:inherit;font-size:11px;font-weight:700;cursor:pointer;background:var(--blue,#003399);color:#fff;border:none;border-radius:7px;padding:4px 8px;line-height:1;box-shadow:0 2px 8px rgba(0,0,0,.25);opacity:.92}
+body.admin-on .editimg:hover{opacity:1}
+body.admin-on .thumb,body.admin-on .cns-img{outline:1px dashed transparent;transition:outline-color .12s}
+body.admin-on .thumb:hover,body.admin-on .cns-img:hover{outline-color:var(--blue,#003399)}
+
 </style>
 </head>
-<body>
-<div id="kvsplash" role="dialog" aria-label="New Epson models">
-  <div class="kv-bar" id="kvBar"></div>
-  <div class="kv-brand"><b>EPSON</b> EcoTank · New Models</div>
-  <button class="kv-skip" id="kvSkip">Skip ✕</button>
-  <div class="kv-stage" id="kvStage"></div>
-  <div class="kv-dots" id="kvDots"></div>
-</div>
+<body id="artifacts-component-root-html" class="">
+
 
 
 <header class="site"><div class="wrap head">
   <div class="brand">
     <span class="htitle"><b>Epson</b> Main Units Sales Portal</span>
   </div>
-  <nav class="right">
+  <nav class="right"><button id="adminBtn" class="adminbtn" type="button" title="Admin login">🔓 Admin (on)</button>
     <a href="#" data-jump="EcoTank">EcoTank</a>
     <a href="#" data-jump="Business Inkjet">Business Inkjet</a>
   </nav>
 </div></header>
 
-<div class="maintabs"><div class="wrap" id="maintabs"></div></div>
+<div class="maintabs"><div class="wrap" id="maintabs"><button class="mtab" data-cat="EcoTank">EcoTank Printers</button><button class="mtab" data-cat="Business Inkjet">Business Inkjet Printers</button><button class="mtab" data-cat="Pricelist">Pricelist<span class="c xls">XLS</span></button><button class="mtab on" data-cat="Consumables">Consumables</button><button class="mtab" data-cat="Service">Service Centers</button></div></div>
 
-<div class="toolbar"><div class="wrap">
+<div class="toolbar" style="display: none;"><div class="wrap">
   <div class="tb-top">
     <label class="search">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
       <input id="q" type="search" placeholder="Search model, e.g. L3550, WF-C5890, ADF…" autocomplete="off">
     </label>
     <div class="fmt" id="fmt">
@@ -326,15 +754,15 @@ footer.site{background:var(--blue-deep);color:#cdd7ee;margin-top:10px}
       <button data-f="A3">A3 / A3+</button>
     </div>
   </div>
-  <div class="chips" id="chips"></div>
-  <div class="count" id="count"></div>
+  <div class="chips" id="chips"><button class="chip on" data-g="all"><span class="dot" style="background:var(--ink)"></span>All EcoTank Printers</button><button class="chip" data-g="For Home Users and Students" style="--c: var(--g-home);"><span class="dot"></span>Home &amp; Students</button><button class="chip" data-g="For Photo Enthusiasts" style="--c: var(--g-photo);"><span class="dot"></span>Photo</button><button class="chip" data-g="For Small Businesses and Home Offices" style="--c: var(--g-smb);"><span class="dot"></span>Small Business</button></div>
+  <div class="count" id="count">Showing 19 EcoTank Printers</div>
 </div></div>
 
-<main class="catalog"><div class="wrap"><div class="grid" id="grid"></div></div></main>
+<main class="catalog" style="display: none;"><div class="wrap"><div class="grid" id="grid"></div></div></main>
 
 <div id="pricelist" style="display:none"></div>
 <div id="servicecenters" style="display:none"></div>
-<div id="consumables" style="display:none"></div>
+<div id="consumables" style=""></div>
 
 
 
@@ -460,7 +888,7 @@ function priceBlock(p){
     let cls="pc";
     if(label==="SRP")cls+=" srp";
     else if(i===p.prices.length-1)cls+=" best";
-    return `<div class="${cls}"><div class="pl">${label}</div><div class="pv">${peso(val)}</div></div>`;
+    return `<div class="${cls}"><div class="pl">${label}</div><div class="pv" data-f="price:${i}">${peso(val)}</div></div>`;
   }).join("");
   return `<div class="prices${three?' three':''}">${cells}</div>`;
 }
@@ -511,18 +939,18 @@ function card(p){
   const meta=GROUPS[p.group]; const c=meta.color;
   const ks=keySpecs(p).map(([l,v])=>`<div class="ks"><div class="l">${l}</div><div class="v">${v}</div></div>`).join("");
   const badge=p.isNew?'<span class="badge">New</span>':'';
-  return `<article class="card" style="--c:${c}">
+  return `<article class="card" data-model="${p.model}" style="--c:${c}">
     <div class="accent"></div>${badge}
-    <div class="thumb">${MODEL_IMG[p.model]?`<img class="pimg" src="${MODEL_IMG[p.model]}" alt="Epson ${p.model}" loading="lazy">`:printerSVG(svgType(p),c)}</div>
+    <div class="thumb" data-editimg><button class="editimg" type="button" title="Change image">✎ Edit</button>${MODEL_IMG[p.model]?`<img class="pimg" src="${MODEL_IMG[p.model]}" alt="Epson ${p.model}" loading="lazy">`:printerSVG(svgType(p),c)}</div>
     <div class="body">
       <div class="eyebrow">${meta.label}</div>
       <h3 class="model">Epson ${p.model}<span class="fmtbadge">${p.format}</span></h3>
       <div class="typeline">${p.type}</div>
       ${priceBlock(p)}
       <div class="keyspecs">${ks}</div>
-      <p class="desc clamp">${p.short}</p>
+      <p class="desc clamp" data-f="short">${p.short}</p>
       <div class="more-full">
-        <p class="desc" style="margin:4px 0 0">${p.long}</p>
+        <p class="desc" style="margin:4px 0 0" data-f="long">${p.long}</p>
         <table class="spectable">${specRows(p)}</table>
       </div>
       <div class="foot">
@@ -640,7 +1068,7 @@ function cnsType(it){ const n=it.name.toLowerCase(), s=(it.sku||'').toUpperCase(
   if(/cartridge/.test(n) || /C13T(188|792|289|290|372)/.test(s)) return 'cart';
   return 'bottle'; }
 function cnsVisual(it){
-  if(!it.mc && CONS_IMG[it.sku]) return `<img src="${CONS_IMG[it.sku]}" alt="${it.name}">`;
+  if(CONS_IMG[it.sku]) return `<img src="${CONS_IMG[it.sku]}" alt="${it.name}">`;
   const c=cnsColor(it.name)||'#7a869a', t=cnsType(it);
   if(t==='mbox') return `<svg viewBox="0 0 80 100"><rect x="14" y="34" width="52" height="48" rx="4" fill="#aab3bd"/><rect x="14" y="34" width="52" height="14" rx="4" fill="#8b95a1"/><rect x="29" y="54" width="22" height="20" rx="2" fill="#fff" opacity=".75"/><text x="40" y="68" font-size="9" text-anchor="middle" fill="#5b6470" font-family="sans-serif" font-weight="700">MAINT</text></svg>`;
   if(t==='carton') return `<svg viewBox="0 0 80 100"><path d="M16 40 L40 30 L64 40 L64 82 L16 82 Z" fill="#d3aa6f"/><path d="M16 40 L40 30 L64 40 L40 50 Z" fill="#e2bf88"/><path d="M40 50 L40 82" stroke="#b98e52" stroke-width="1.4"/><rect x="29" y="58" width="22" height="7" fill="#fff" opacity=".6"/><circle cx="40" cy="44" r="4.5" fill="${c}"/></svg>`;
@@ -673,16 +1101,16 @@ function renderConsumablesResults(){
   cnsEl.querySelector('#cnscount').textContent=list.length+" item"+(list.length===1?"":"s")+(q?` matching \u201c${cnsState.q}\u201d`:"");
   const wrap=cnsEl.querySelector('#cnsbody');
   if(!list.length){ wrap.innerHTML='<div class="cnsnone">No consumables match your search.</div>'; return; }
-  wrap.innerHTML=list.map(x=>`<div class="cns-card${x.mc?' mc':''}">
-      <div class="cns-img">${cnsVisual(x)}</div>
+  wrap.innerHTML=list.map(x=>`<div class="cns-card${x.mc?' mc':''}" data-sku="${x.sku}">
+      <div class="cns-img" data-editimg><button class="editimg" type="button" title="Change image">✎ Edit</button>${cnsVisual(x)}</div>
       <div class="cns-info">
-        <div class="cns-name">${x.name}${x.mc?'<span class="cns-badge">CARTON</span>':''}</div>
+        <div class="cns-name"><span class="cns-ntext" data-f="name">${x.name}</span>${x.mc?'<span class="cns-badge">CARTON</span>':''}</div>
         <div class="cns-sku">${x.sku||'\u2014'}</div>
         <div class="cns-prices">
-          <div class="pp"><span class="lab">Dealer Price</span><span class="val">${x.dp||'\u2014'}</span></div>
-          <div class="pp srp"><span class="lab">SRP</span><span class="val">${x.srp||'\u2014'}</span></div>
+          <div class="pp"><span class="lab">Dealer Price</span><span class="val" data-f="dp">${x.dp||'\u2014'}</span></div>
+          <div class="pp srp"><span class="lab">SRP</span><span class="val" data-f="srp">${x.srp||'\u2014'}</span></div>
         </div>
-        <div class="cns-compat"><span class="lab">Compatible Printers</span>${x.compat||'\u2014'}</div>
+        <div class="cns-compat"><span class="lab">Compatible Printers</span><span class="cval" data-f="compat">${x.compat||'\u2014'}</span></div>
       </div>
     </div>`).join("");
 }
@@ -754,5 +1182,229 @@ buildMainTabs(); applyView();
   document.addEventListener('keydown',e=>{ if(e.key==='Escape') dismiss(); });
 })();
 </script>
-</body>
-</html>
+<script id="ion-edits" type="application/json">eyJwcm9kIjp7IkwxMjEiOnsicHJpY2VzIjpbWyJTUlAiLDU0OTVdLFsiRGVhbGVyIFByaWNlIiw1MDU3XV19LCJMMTMxMCI6eyJwcmljZXMiOltbIlNSUCIsODE3NV0sWyJEZWFsZXIgUHJpY2UiLDc1MzBdXX19LCJjb25zIjp7IkMxM1QwMFYxMDBQOSI6eyJkcCI6IuKCsTE2LDc1MCIsInNycCI6IuKCsTE4LDYwMCJ9LCJDMTNUMDBWMjAwUDkiOnsic3JwIjoi4oKxMzIwIn19fQ==</script>
+<script>
+/* ===== Iontech pricelist inline admin editor ===== */
+(function(){
+  "use strict";
+  const PW = "ABCD";
+  let ADMIN = false, dirty = false;
+  let OVERRIDES = { prod:{}, cons:{} };
+
+  /* ---- serialization helpers ---- */
+  function b64toObj(b){ try{ return JSON.parse(decodeURIComponent(escape(atob(b)))); }catch(e){ return null; } }
+  function objToB64(o){ return btoa(unescape(encodeURIComponent(JSON.stringify(o)))); }
+  function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function loadOverrides(){
+    let o=null;
+    const el=document.getElementById('ion-edits');
+    if(el && el.textContent.trim()) o=b64toObj(el.textContent.trim());
+    if(!o){ try{ const ls=localStorage.getItem('ionEdits'); if(ls) o=JSON.parse(ls); }catch(e){} }
+    OVERRIDES = (o && o.prod && o.cons) ? o : { prod:{}, cons:{} };
+  }
+  function saveLocal(){ try{ localStorage.setItem('ionEdits', JSON.stringify(OVERRIDES)); }catch(e){} }
+  function ovProd(m){ return OVERRIDES.prod[m] || (OVERRIDES.prod[m]={}); }
+  function ovCons(s){ return OVERRIDES.cons[s] || (OVERRIDES.cons[s]={}); }
+
+  function applyOverrides(){
+    Object.keys(OVERRIDES.prod).forEach(function(model){
+      const ov=OVERRIDES.prod[model];
+      const p=(typeof PRODUCTS!=='undefined')&&PRODUCTS.find(function(x){return x.model===model;});
+      if(!p) return;
+      if(ov.prices) p.prices=ov.prices.map(function(a){return a.slice();});
+      if(ov.short!=null) p.short=ov.short;
+      if(ov.long!=null)  p.long=ov.long;
+      if(ov.img!=null && typeof MODEL_IMG!=='undefined') MODEL_IMG[model]=ov.img;
+    });
+    Object.keys(OVERRIDES.cons).forEach(function(sku){
+      const ov=OVERRIDES.cons[sku];
+      const c=(typeof CONSUMABLES!=='undefined')&&CONSUMABLES.find(function(x){return x.sku===sku;});
+      if(!c) return;
+      ['dp','srp','name','compat'].forEach(function(f){ if(ov[f]!=null) c[f]=ov[f]; });
+      if(ov.img!=null && typeof CONS_IMG!=='undefined') CONS_IMG[sku]=ov.img;
+    });
+  }
+  function reRender(kind){
+    if(kind==='cons'){ if(typeof renderConsumablesResults==='function') renderConsumablesResults(); }
+    else { if(typeof render==='function') render(); }
+  }
+
+  /* ---- boot: apply saved edits, then re-render current view ---- */
+  loadOverrides(); applyOverrides();
+  if(typeof applyView==='function') applyView();
+
+  /* ---- admin toolbar (bottom) ---- */
+  const bar=document.createElement('div');
+  bar.className='ion-adminbar'; bar.style.display='none';
+  bar.innerHTML =
+    '<span class="ion-abtxt"><b>Admin mode</b> — click any <u>price</u>, <u>text</u>, or <u>image</u> on a product card to edit. Edits auto-save on this device; use <b>Save &amp; Download</b> to export a file you can share or host.</span>'+
+    '<span class="ion-abbtns">'+
+      '<span class="ion-dirty" id="ionDirty"></span>'+
+      '<button class="ion-btn ghost" id="ionRevert" type="button">Discard changes</button>'+
+      '<button class="ion-btn" id="ionSave" type="button">Save &amp; Download</button>'+
+      '<button class="ion-btn ghost" id="ionExit" type="button">Exit</button>'+
+    '</span>';
+  document.body.appendChild(bar);
+  function updateDirty(){ const d=document.getElementById('ionDirty'); if(d) d.textContent = dirty ? '\u25CF Unsaved export' : '\u2713 Saved on device'; }
+  function markDirty(){ saveLocal(); dirty=true; updateDirty(); }
+
+  /* ---- password modal ---- */
+  const modal=document.createElement('div');
+  modal.className='ion-modal';
+  modal.innerHTML =
+    '<div class="ion-modal-box">'+
+      '<h3>Admin sign-in</h3>'+
+      '<p>Enter the admin password to edit prices, descriptions and images.</p>'+
+      '<input type="password" id="ionPw" placeholder="Password" autocomplete="off">'+
+      '<div class="ion-err" id="ionErr"></div>'+
+      '<div class="ion-modal-actions">'+
+        '<button class="ion-btn ghost" id="ionCancel" type="button">Cancel</button>'+
+        '<button class="ion-btn" id="ionOk" type="button">Sign in</button>'+
+      '</div>'+
+    '</div>';
+  document.body.appendChild(modal);
+  const pwInput=modal.querySelector('#ionPw'), errEl=modal.querySelector('#ionErr');
+  function openModal(){ modal.classList.add('open'); pwInput.value=''; errEl.textContent=''; setTimeout(function(){pwInput.focus();},50); }
+  function closeModal(){ modal.classList.remove('open'); }
+  function tryPw(){ if(pwInput.value===PW){ closeModal(); setAdmin(true); } else { errEl.textContent='Incorrect password.'; pwInput.select(); } }
+  modal.querySelector('#ionCancel').onclick=closeModal;
+  modal.querySelector('#ionOk').onclick=tryPw;
+  pwInput.addEventListener('keydown',function(e){ if(e.key==='Enter')tryPw(); if(e.key==='Escape')closeModal(); });
+  modal.addEventListener('click',function(e){ if(e.target===modal) closeModal(); });
+
+  /* ---- admin on/off ---- */
+  const btn=document.getElementById('adminBtn');
+  function setAdmin(on){
+    ADMIN=on;
+    document.body.classList.toggle('admin-on',on);
+    if(btn) btn.textContent = on ? '\uD83D\uDD13 Admin (on)' : '\uD83D\uDD12 Admin';
+    bar.style.display = on ? '' : 'none';
+    updateDirty();
+  }
+  if(btn) btn.addEventListener('click',function(){ if(ADMIN) doExit(); else openModal(); });
+  function doExit(){
+    if(dirty && !confirm('You have changes that are saved on this device but not yet exported. Exit admin mode anyway?')) return;
+    setAdmin(false);
+  }
+  bar.querySelector('#ionExit').onclick=doExit;
+  bar.querySelector('#ionRevert').onclick=function(){
+    if(!confirm('Discard all edits and restore the last saved/exported version? This cannot be undone.')) return;
+    try{ localStorage.removeItem('ionEdits'); }catch(e){}
+    OVERRIDES={prod:{},cons:{}};
+    location.reload();
+  };
+  bar.querySelector('#ionSave').onclick=downloadFile;
+
+  /* ---- inline text / price editing ---- */
+  document.addEventListener('click',function(e){
+    if(!ADMIN) return;
+    const imgBtn=e.target.closest('.editimg');
+    if(imgBtn){ e.preventDefault(); pickImage(imgBtn.closest('[data-editimg]')); return; }
+    const el=e.target.closest('[data-f]');
+    if(el && !el.classList.contains('ion-editing')){ startEdit(el); }
+  });
+  function startEdit(el){
+    el.contentEditable='true'; el.classList.add('ion-editing'); el.focus();
+    const r=document.createRange(); r.selectNodeContents(el);
+    const sel=getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  }
+  document.addEventListener('keydown',function(e){
+    if(!ADMIN) return;
+    const el=e.target.closest && e.target.closest('[data-f]');
+    if(el && el.classList.contains('ion-editing')){
+      if(e.key==='Enter' && el.dataset.f!=='long'){ e.preventDefault(); el.blur(); }
+      else if(e.key==='Escape'){ e.preventDefault(); el.dataset.cancel='1'; el.blur(); }
+    }
+  });
+  document.addEventListener('focusout',function(e){
+    const el=e.target.closest && e.target.closest('[data-f]');
+    if(el && el.classList.contains('ion-editing')) commitEdit(el);
+  });
+  function commitEdit(el){
+    el.contentEditable='false'; el.classList.remove('ion-editing');
+    const cancelled=el.dataset.cancel; delete el.dataset.cancel;
+    const f=el.dataset.f;
+    const cardEl=el.closest('[data-model]'), cnsEl2=el.closest('[data-sku]');
+    if(cancelled){ if(cnsEl2) reRender('cons'); else reRender('prod'); return; }
+    const val=el.textContent.trim();
+    if(cardEl){
+      const model=cardEl.dataset.model;
+      const p=PRODUCTS.find(function(x){return x.model===model;}); if(!p) return;
+      const ov=ovProd(model);
+      if(f.indexOf('price:')===0){
+        const idx=+f.split(':')[1];
+        const num=Number(val.replace(/[^\d.]/g,''));
+        if(!isNaN(num) && val!==''){ p.prices[idx][1]=num; ov.prices=p.prices.map(function(a){return a.slice();}); }
+      } else if(f==='short'){ p.short=esc(val); ov.short=p.short; }
+      else if(f==='long'){ p.long=esc(val); ov.long=p.long; }
+      markDirty(); reRender('prod');
+    } else if(cnsEl2){
+      const sku=cnsEl2.dataset.sku;
+      const c=CONSUMABLES.find(function(x){return x.sku===sku;}); if(!c) return;
+      const ov=ovCons(sku);
+      let v=val;
+      if((f==='dp'||f==='srp')){ if(v && v.indexOf('\u20B1')<0 && /\d/.test(v)) v='\u20B1'+v.replace(/^[^\d]*/,''); }
+      else { v=esc(v); }
+      c[f]=v; ov[f]=v;
+      markDirty(); reRender('cons');
+    }
+  }
+
+  /* ---- image replace (with client-side downscale) ---- */
+  let imgTarget=null;
+  const fileInput=document.createElement('input');
+  fileInput.type='file'; fileInput.accept='image/*'; fileInput.style.display='none';
+  document.body.appendChild(fileInput);
+  function pickImage(box){ imgTarget=box; fileInput.value=''; fileInput.click(); }
+  fileInput.addEventListener('change',function(){
+    const file=fileInput.files[0]; if(!file || !imgTarget) return;
+    const box=imgTarget;
+    const fr=new FileReader();
+    fr.onload=function(){ downscale(fr.result, box.closest('[data-sku]')?411:600, function(url){ applyImage(box,url); }); };
+    fr.readAsDataURL(file);
+  });
+  function downscale(dataUrl, maxSide, cb){
+    const img=new Image();
+    img.onload=function(){
+      let w=img.width, h=img.height;
+      const scale=Math.min(1, maxSide/Math.max(w,h));
+      w=Math.max(1,Math.round(w*scale)); h=Math.max(1,Math.round(h*scale));
+      const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+      const ctx=cv.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h); ctx.drawImage(img,0,0,w,h);
+      try{ cb(cv.toDataURL('image/jpeg',0.82)); }catch(e){ cb(dataUrl); }
+    };
+    img.onerror=function(){ cb(dataUrl); };
+    img.src=dataUrl;
+  }
+  function applyImage(box,dataUrl){
+    const cns=box.closest('[data-sku]'), card=box.closest('[data-model]');
+    if(cns){ const sku=cns.dataset.sku; CONS_IMG[sku]=dataUrl; ovCons(sku).img=dataUrl; markDirty(); reRender('cons'); }
+    else if(card){ const model=card.dataset.model; MODEL_IMG[model]=dataUrl; ovProd(model).img=dataUrl; markDirty(); reRender('prod'); }
+  }
+
+  /* ---- export edited file ---- */
+  function downloadFile(){
+    const clone=document.documentElement.cloneNode(true);
+    ['grid','consumables','pricelist','servicecenters'].forEach(function(id){
+      const el=clone.querySelector('#'+id); if(el) el.innerHTML='';
+    });
+    Array.prototype.forEach.call(clone.querySelectorAll('.ion-adminbar,.ion-modal'),function(e){ e.remove(); });
+    const b=clone.querySelector('body'); if(b) b.classList.remove('admin-on');
+    let s=clone.querySelector('#ion-edits');
+    if(!s){ s=document.createElement('script'); s.id='ion-edits'; s.type='application/json'; (clone.querySelector('body')||clone).appendChild(s); }
+    s.textContent=objToB64(OVERRIDES);
+    const out='<!doctype html>\n'+clone.outerHTML;
+    const blob=new Blob([out],{type:'text/html'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='Iontech_Epson_Pricelist.html';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); },2000);
+    dirty=false; updateDirty();
+  }
+})();
+
+</script><input type="file" accept="image/*" style="display: none;">
+
+</body></html>
