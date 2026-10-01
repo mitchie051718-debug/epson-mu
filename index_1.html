@@ -787,7 +787,7 @@ body.admin-on .thumb:hover,body.admin-on .cns-img:hover{outline-color:var(--blue
     </div>
   </div>
   
-  <div class="count" id="count">Showing 19 EcoTank Printers</div>
+  <div class="count" id="count">Showing 19 EcoTank Printers</div><button class="dlbtn prod-addbtn" id="prodAddBtn" type="button" style="margin-top:8px;background:var(--blue);color:#fff;border-color:var(--blue)">+ Add Model</button>
 </div></div>
 
 <main class="catalog" style="display: none;"><div class="wrap"><div class="grid" id="grid"></div></div></main>
@@ -1280,7 +1280,7 @@ buildMainTabs(); applyView();
   "use strict";
   const PW = "ABCD";
   let ADMIN = false, dirty = false;
-  let OVERRIDES = { prod:{}, cons:{}, consNew:[] };
+  let OVERRIDES = { prod:{}, cons:{}, consNew:[], prodNew:[] };
 
   /* ---- serialization helpers ---- */
   function b64toObj(b){ try{ return JSON.parse(decodeURIComponent(escape(atob(b)))); }catch(e){ return null; } }
@@ -1294,6 +1294,7 @@ buildMainTabs(); applyView();
     if(!o){ try{ const ls=localStorage.getItem('ionEdits'); if(ls) o=JSON.parse(ls); }catch(e){} }
     OVERRIDES = (o && o.prod && o.cons) ? o : { prod:{}, cons:{}, consNew:[] };
     if(!Array.isArray(OVERRIDES.consNew)) OVERRIDES.consNew=[];
+    if(!Array.isArray(OVERRIDES.prodNew)) OVERRIDES.prodNew=[];
   }
   function saveLocal(){ try{ localStorage.setItem('ionEdits', JSON.stringify(OVERRIDES)); }catch(e){} }
   function ovProd(m){ return OVERRIDES.prod[m] || (OVERRIDES.prod[m]={}); }
@@ -1341,7 +1342,16 @@ buildMainTabs(); applyView();
       if(it.img && typeof CONS_IMG!=='undefined') CONS_IMG[it.sku]=it.img;
     });
   }
-  loadOverrides(); mergeAddedCons(); applyOverrides();
+  function mergeAddedProds(){
+    if(typeof PRODUCTS==='undefined' || !Array.isArray(OVERRIDES.prodNew)) return;
+    OVERRIDES.prodNew.forEach(function(it){
+      if(!it || !it.model) return;
+      if(PRODUCTS.some(function(x){return x.model===it.model;})) return;
+      PRODUCTS.push({cat:it.cat,group:it.group,model:it.model,format:it.format||'',band:it.band||it.format||'',type:it.type||'',functions:Array.isArray(it.functions)?it.functions:[],isNew:!!it.isNew,prices:it.prices||[['SRP',null],['Dealer Price',null]],short:it.short||'',long:it.long||'',specs:it.specs||{}});
+      if(it.img && typeof MODEL_IMG!=='undefined') MODEL_IMG[it.model]=it.img;
+    });
+  }
+  loadOverrides(); mergeAddedCons(); mergeAddedProds(); applyOverrides();
   if(typeof applyView==='function') applyView();
 
   /* ---- admin toolbar (bottom) ---- */
@@ -1609,6 +1619,104 @@ buildMainTabs(); applyView();
       var add=e.target.closest('.specadd-btn');
       if(add){ e.preventDefault(); var p2=findProd(add); if(!p2) return; var box=add.closest('.specadd'); var ki=box.querySelector('.specadd-k'), vi=box.querySelector('.specadd-v'); var kk=(ki.value||'').trim(), vv=(vi.value||'').trim(); if(!kk){ ki.focus(); return; } p2.specs[kk]=vv; ovProd(p2.model).specs=Object.assign({},p2.specs); markDirty(); reRender('prod'); reopenCard(p2.model); return; }
     });
+  })();
+
+  /* ---- add new product / model (admin) ---- */
+  (function(){
+    var st=document.createElement('style');
+    st.textContent=
+      '.prod-addbtn{display:none!important}'+
+      'body.admin-on .prod-addbtn{display:inline-flex!important;align-items:center;gap:6px}'+
+      '.ion-fieldrow select{width:100%;padding:8px 10px;border:1px solid #ccd3dc;border-radius:8px;font:inherit;box-sizing:border-box;background:#fff}'+
+      '.ion-fieldrow select:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 2px rgba(0,64,153,.12)}';
+    document.head.appendChild(st);
+
+    function esc2(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function catList(){ var seen={},out=[]; PRODUCTS.forEach(function(p){ if(!seen[p.cat]){seen[p.cat]=1;out.push(p.cat);} }); return out; }
+    function catLabel(c){ var pre=(c==='Business Inkjet')?'EP COMM':'EP INKJET'; var cl=(typeof CATLABEL!=='undefined'&&CATLABEL[c])?CATLABEL[c]:c; return pre+' \u00b7 '+cl; }
+    function groupsFor(c){ return (typeof catGroups==='function')?catGroups(c):[]; }
+    function groupLabel(g){ return (typeof GROUPS!=='undefined'&&GROUPS[g]&&GROUPS[g].label)?GROUPS[g].label:g; }
+
+    var m=document.createElement('div');
+    m.className='ion-modal ion-addmodal ion-prodmodal';
+    m.innerHTML=
+      '<div class="ion-modal-box ion-addbox">'+
+        '<h3>Add model</h3>'+
+        '<p>Add a new EP INKJET / EP COMM listing. It appears immediately and is included when you Save &amp; Download. You can edit its type, format and full specs inline afterward.</p>'+
+        '<div class="ion-fieldrow2">'+
+          '<div class="ion-fieldrow"><label>Category</label><select id="apCat"></select></div>'+
+          '<div class="ion-fieldrow"><label>Sub-category</label><select id="apGroup"></select></div>'+
+        '</div>'+
+        '<div class="ion-fieldrow"><label>Item (model)</label><input type="text" id="apModel" placeholder="e.g. L8050"></div>'+
+        '<div class="ion-fieldrow"><label>SKU</label><input type="text" id="apSku" placeholder="e.g. C11CJ60501"></div>'+
+        '<div class="ion-fieldrow2">'+
+          '<div class="ion-fieldrow"><label>Dealer Price</label><input type="text" id="apDp" placeholder="\u20B10"></div>'+
+          '<div class="ion-fieldrow"><label>SRP</label><input type="text" id="apSrp" placeholder="\u20B10"></div>'+
+        '</div>'+
+        '<div class="ion-fieldrow2">'+
+          '<div class="ion-fieldrow"><label>Type line <span style="font-weight:400;color:#889">(optional)</span></label><input type="text" id="apType" placeholder="e.g. 4-colour EcoTank \u00b7 33/20 ppm"></div>'+
+          '<div class="ion-fieldrow" style="max-width:120px"><label>Format <span style="font-weight:400;color:#889">(opt.)</span></label><select id="apFmt"><option value="">\u2014</option><option value="A4">A4</option><option value="A3">A3</option></select></div>'+
+        '</div>'+
+        '<div class="ion-fieldrow"><label>Item image</label><div class="ion-imgpick"><button type="button" class="ion-btn ghost" id="apImgBtn">Choose image\u2026</button><span id="apImgName" class="ion-imgname">No image selected</span></div><img id="apImgPrev" class="ion-imgprev" style="display:none" alt=""></div>'+
+        '<div class="ion-err" id="apErr"></div>'+
+        '<div class="ion-modal-actions">'+
+          '<button class="ion-btn ghost" id="apCancel" type="button">Cancel</button>'+
+          '<button class="ion-btn" id="apOk" type="button">Add model</button>'+
+        '</div>'+
+      '</div>';
+    document.body.appendChild(m);
+    function sel(q){ return m.querySelector(q); }
+
+    function fillGroups(){ var c=sel('#apCat').value; sel('#apGroup').innerHTML=groupsFor(c).map(function(g){return '<option value="'+esc2(g)+'">'+esc2(groupLabel(g))+'</option>';}).join(''); }
+    function fillCats(){ sel('#apCat').innerHTML=catList().map(function(c){return '<option value="'+esc2(c)+'">'+esc2(catLabel(c))+'</option>';}).join(''); fillGroups(); }
+    sel('#apCat').addEventListener('change',fillGroups);
+
+    var apImgData=null;
+    var apFile=document.createElement('input'); apFile.type='file'; apFile.accept='image/*'; apFile.style.display='none'; document.body.appendChild(apFile);
+    sel('#apImgBtn').onclick=function(){ apFile.value=''; apFile.click(); };
+    apFile.addEventListener('change',function(){
+      var f=apFile.files[0]; if(!f) return;
+      var fr=new FileReader();
+      fr.onload=function(){ downscale(fr.result,600,function(url){ apImgData=url; var pv=sel('#apImgPrev'); pv.src=url; pv.style.display=''; sel('#apImgName').textContent=f.name; }); };
+      fr.readAsDataURL(f);
+    });
+
+    function openAddProd(){
+      fillCats();
+      ['apModel','apSku','apDp','apSrp','apType'].forEach(function(id){ sel('#'+id).value=''; });
+      sel('#apFmt').value='';
+      apImgData=null; sel('#apImgPrev').style.display='none'; sel('#apImgName').textContent='No image selected';
+      sel('#apErr').textContent='';
+      m.classList.add('open'); setTimeout(function(){ sel('#apModel').focus(); },50);
+    }
+    function closeAddProd(){ m.classList.remove('open'); }
+    function priceNum(v){ v=(v||'').replace(/[^\d.]/g,''); return v===''?null:Number(v); }
+    function doAddProd(){
+      var cat=sel('#apCat').value, group=sel('#apGroup').value;
+      var model=sel('#apModel').value.trim(), sku=sel('#apSku').value.trim();
+      var err=sel('#apErr');
+      if(!cat||!group){ err.textContent='Choose a category and sub-category.'; return; }
+      if(!model){ err.textContent='Item (model) is required \u2014 it is the unique key for the card and its image.'; return; }
+      if(PRODUCTS.some(function(x){return String(x.model).toLowerCase()===model.toLowerCase();})){ err.textContent='A product with that model already exists.'; return; }
+      var fmt=sel('#apFmt').value;
+      var specs={}; if(sku) specs['SKU Code']=sku;
+      var funcs=(group==='Scanners')?['Scan']:['Print'];
+      var prod={cat:cat,group:group,model:model,format:fmt,band:fmt,type:sel('#apType').value.trim(),functions:funcs,isNew:true,
+        prices:[['SRP',priceNum(sel('#apSrp').value)],['Dealer Price',priceNum(sel('#apDp').value)]],
+        short:'',long:'',specs:specs};
+      PRODUCTS.push(prod);
+      if(apImgData) MODEL_IMG[model]=apImgData;
+      var stored=JSON.parse(JSON.stringify(prod)); stored.sku=sku; if(apImgData) stored.img=apImgData;
+      OVERRIDES.prodNew.push(stored);
+      markDirty();
+      closeAddProd();
+      if(typeof epJump==='function'){ epJump(cat, model, group); }
+      else { reRender('prod'); }
+    }
+    sel('#apCancel').onclick=closeAddProd;
+    sel('#apOk').onclick=doAddProd;
+    m.addEventListener('click',function(e){ if(e.target===m) closeAddProd(); });
+    document.addEventListener('click',function(e){ var b=e.target.closest && e.target.closest('#prodAddBtn'); if(b && ADMIN) openAddProd(); });
   })();
 
   /* ---- export edited file ---- */
